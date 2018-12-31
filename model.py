@@ -19,118 +19,57 @@ def l2norm(X):
     return X
 
 
-def EncoderImage(data_name, img_dim, embed_size, finetune=False,
-                 cnn_type='vgg19', use_abs=False, no_imgnorm=False):
-    """A wrapper to image encoders. Chooses between an encoder that uses
-    precomputed image features, `EncoderImagePrecomp`, or an encoder that
-    computes image features on the fly `EncoderImageFull`.
+def get_sort_unsort(lengths):
     """
-    if data_name.endswith('_precomp') or data_name == "m30k":
-        img_enc = EncoderImagePrecomp(
-            img_dim, embed_size, use_abs, no_imgnorm)
-    else:
-        img_enc = EncoderImageFull(
-            embed_size, finetune, cnn_type, use_abs, no_imgnorm)
-
-    return img_enc
+    Given the lenghts of sequences give sorted indices and then the indices to sort it back.
+    """
+    _, sort = torch.sort(lengths, descending=True)
+    _, unsort = sort.sort()
+    return sort, unsort
 
 
-# tutorials/09 - Image Captioning
-class EncoderImageFull(nn.Module):
+def pad_flat_batch(emb, nwords, batch_first=True):
+    """
+    Transform a 2D flat batch (batch of words in multiple sentences) into a 3D
+    padded batch where words have been allocated to their respective sentence
+    according to user passed sentence lengths `nwords`
 
-    def __init__(self, embed_size, finetune=False, cnn_type='vgg19',
-                 use_abs=False, no_imgnorm=False):
-        """Load pretrained VGG19 and replace top fc layer."""
-        super(EncoderImageFull, self).__init__()
-        self.embed_size = embed_size
-        self.no_imgnorm = no_imgnorm
-        self.use_abs = use_abs
+    Parameters
+    ===========
+    emb : torch.Tensor(total_words x emb_dim), flattened tensor of word embeddings
+    nwords : torch.Tensor(batch), number of words per sentence
 
-        # Load a pre-trained model
-        self.cnn = self.get_cnn(cnn_type, True)
+    Returns
+    =======
+    torch.Tensor(max_seq_len x batch x emb_dim) where:
+        - max_seq_len = max(nwords)
+        - batch = len(nwords)
 
-        # For efficient memory usage.
-        for param in self.cnn.parameters():
-            param.requires_grad = finetune
+    >>> emb = [[0], [1], [2], [3], [4], [5]]
+    >>> nwords = [3, 1, 2]
+    >>> pad_flat_batch(torch.tensor(emb), torch.tensor(nwords)).tolist()
+    [[[0], [3], [4]], [[1], [0], [5]], [[2], [0], [0]]]
+    """
+    maxlen = torch.max(nwords)
+    
+    with torch.no_grad():
+        if len(emb) != sum(nwords):
+            raise ValueError("Got {} items but was asked to pad {}"
+                             .format(len(emb), sum(nwords)))
 
-        # Replace the last fully connected layer of CNN with a new one
-        if cnn_type.startswith('vgg'):
-            self.fc = nn.Linear(self.cnn.classifier._modules['6'].in_features,
-                                embed_size)
-            self.cnn.classifier = nn.Sequential(
-                *list(self.cnn.classifier.children())[:-1])
-        elif cnn_type.startswith('resnet'):
-            self.fc = nn.Linear(self.cnn.module.fc.in_features, embed_size)
-            self.cnn.module.fc = nn.Sequential()
+        output, last = [], 0
 
-        self.init_weights()
+        for sentlen in nwords:
+            padding = (0, 0, 0, maxlen - sentlen)
+            output.append(torch.nn.functional.pad(emb[last:last+sentlen], padding))
+            last = last + sentlen
 
-    def get_cnn(self, arch, pretrained):
-        """Load a pretrained CNN and parallelize over GPUs
-        """
-        if pretrained:
-            print("=> using pre-trained model '{}'".format(arch))
-            model = models.__dict__[arch](pretrained=True)
-        else:
-            print("=> creating model '{}'".format(arch))
-            model = models.__dict__[arch]()
+        # (seq_len x batch x emb_dim)
+        output = torch.stack(output, dim=1)
+        if batch_first:
+            output = output.permute(1, 0, 2)
 
-        if arch.startswith('alexnet') or arch.startswith('vgg'):
-            model.features = nn.DataParallel(model.features)
-            model.cuda()
-        else:
-            model = nn.DataParallel(model).cuda()
-
-        return model
-
-    def load_state_dict(self, state_dict):
-        """
-        Handle the models saved before commit pytorch/vision@989d52a
-        """
-        if 'cnn.classifier.1.weight' in state_dict:
-            state_dict['cnn.classifier.0.weight'] = state_dict[
-                'cnn.classifier.1.weight']
-            del state_dict['cnn.classifier.1.weight']
-            state_dict['cnn.classifier.0.bias'] = state_dict[
-                'cnn.classifier.1.bias']
-            del state_dict['cnn.classifier.1.bias']
-            state_dict['cnn.classifier.3.weight'] = state_dict[
-                'cnn.classifier.4.weight']
-            del state_dict['cnn.classifier.4.weight']
-            state_dict['cnn.classifier.3.bias'] = state_dict[
-                'cnn.classifier.4.bias']
-            del state_dict['cnn.classifier.4.bias']
-
-        super(EncoderImageFull, self).load_state_dict(state_dict)
-
-    def init_weights(self):
-        """Xavier initialization for the fully connected layer
-        """
-        r = np.sqrt(6.) / np.sqrt(self.fc.in_features +
-                                  self.fc.out_features)
-        self.fc.weight.data.uniform_(-r, r)
-        self.fc.bias.data.fill_(0)
-
-    def forward(self, images):
-        """Extract image feature vectors."""
-        features = self.cnn(images)
-
-        # normalization in the image embedding space
-        features = l2norm(features)
-
-        # linear projection to the joint embedding space
-        features = self.fc(features)
-
-        # normalization in the joint embedding space
-        if not self.no_imgnorm:
-            features = l2norm(features)
-
-        # take the absolute value of the embedding (used in order embeddings)
-        if self.use_abs:
-            features = torch.abs(features)
-
-        return features
-
+    return output
 
 class EncoderImagePrecomp(nn.Module):
 
@@ -155,7 +94,7 @@ class EncoderImagePrecomp(nn.Module):
     def forward(self, images):
         """Extract image feature vectors."""
         # assuming that the precomputed features are already l2-normalized
-
+        images = l2norm(images)
         features = self.fc(images)
 
         # normalize in the joint embedding space
@@ -177,7 +116,6 @@ class EncoderImagePrecomp(nn.Module):
         for name, param in state_dict.items():
             if name in own_state:
                 new_state[name] = param
-
         super(EncoderImagePrecomp, self).load_state_dict(new_state)
 
 
@@ -186,18 +124,20 @@ class EncoderImagePrecomp(nn.Module):
 class EncoderText(nn.Module):
 
     def __init__(self, vocab_size, word_dim, embed_size, num_layers,
-                 use_abs=False):
+                 bidi=False, maxtime=True, use_abs=False):
         super(EncoderText, self).__init__()
         self.use_abs = use_abs
         self.embed_size = embed_size
+        self.hidden_size = self.embed_size if not bidi else self.embed_size * 2
+        self.bidi = bidi
+        self.maxtime = maxtime
         # word embedding
         self.embed = nn.Embedding(vocab_size, word_dim)
-
         # caption embedding
-        self.rnn = nn.GRU(word_dim, embed_size, num_layers, batch_first=True)
-
+        self.rnn = nn.GRU(word_dim, embed_size, num_layers, bidirectional=bidi,
+                          batch_first=True)
+        # Initialize weights
         self.init_weights()
-
 
     def init_weights(self, pretrained=False):
         self.embed.weight.data.uniform_(-0.1, 0.1)
@@ -211,17 +151,24 @@ class EncoderText(nn.Module):
 
         # Forward propagate RNN
         out, _ = self.rnn(packed)
-
         # Reshape *final* output to (batch_size, hidden_size)
         padded = pad_packed_sequence(out, batch_first=True)
-        I = torch.LongTensor(lengths).view(-1, 1, 1)
-        I = Variable(I.expand(x.size(0), 1, self.embed_size)-1).cuda()
-        out = torch.gather(padded[0], 1, I).squeeze(1)
-
+        # Take max over time.
+        if self.maxtime:
+            out = torch.max(padded[0], 1)[0]
+        # Take last hidden state.
+        else:
+            I = torch.LongTensor(lengths).view(-1, 1, 1)
+            I = Variable(I.expand(x.size(0), 1, self.embed_size)-1).cuda()
+            out = torch.gather(padded[0], 1, I).squeeze(1)
+        # Take max over direction if bidi
+        if self.bidi:
+            out = out.view(-1, 2, self.hidden_size/2)
+            out = torch.max(out, 1)[0]
         # normalization in the joint embedding space
         out = l2norm(out)
 
-        # take absolute value, used by order embeddings
+	    # take absolute value, used by order embeddings
         if self.use_abs:
             out = torch.abs(out)
 
@@ -229,20 +176,25 @@ class EncoderText(nn.Module):
 
 
 class EncoderTextChar(nn.Module):
-    def __init__(self, vocab_size, word_dim, embed_size, num_layers, use_abs=False):
+    def __init__(self, vocab_size, word_dim, embed_size, num_layers,
+                 bidi=False, maxtime=True, use_abs=False):
         super(EncoderTextChar, self).__init__()
-        if word_dim % 2 != 0:
-            # we will use bidrectional RNN
-            raise ValueError("Please use even word_dim")
         self.use_abs = use_abs
         self.embed_size = embed_size
+        self.hidden_size = self.embed_size if not bidi else self.embed_size * 2
+        self.bidi = bidi
+        self.maxtime = maxtime
+
+        if word_dim % 2 != 0:
+            raise ValueError("Please use even word_dim")
         # char embedding
-        self.embed_char = nn.Embedding(vocab_size, word_dim)
+        self.embed = nn.Embedding(vocab_size, word_dim)
         # word embedding
-        self.embed = nn.GRU(
-            word_dim, word_dim // 2, bidirectional=True, batch_first=True)
+        self.char_rnn = nn.GRU(word_dim, word_dim // (int(bidi) + 1),
+                               batch_first=True)
         # caption embedding
-        self.rnn = nn.GRU(word_dim, embed_size, num_layers=num_layers, batch_first=True)
+        self.word_rnn = nn.GRU(word_dim, embed_size, num_layers=num_layers,
+                               bidirectional=bidi, batch_first=True)
 
         self.init_weights()
 
@@ -270,12 +222,21 @@ class EncoderTextChar(nn.Module):
             last += length
         x = torch.stack(hidden, dim=0)
         # assume nwords is already sorted by length
-        x = pack_padded_sequence(x, nwords, batch_first=True)
-        _, out = self.rnn(x)
-
-        # normalize
+        packed = pack_padded_sequence(x, nwords, batch_first=True)
+        out, _ = self.rnn(packed)
+        padded = pad_packed_sequence(out, batch_first=True)
+        if self.maxtime:
+            out = torch.max(padded[0], 1)[0]
+        else:
+            I = torch.LongTensor(lengths).view(-1, 1, 1)
+            I = Variable(I.expand(x.size(0), 1, self.embed_size)-1).cuda()
+            out = torch.gather(padded[0], 1, I).squeeze(1)
+        # Take max over direction if bidi
+        if self.bidi:
+            out = out.view(-1, 2, self.hidden_size/2)
+            out = torch.max(out, 1)[0]
+        # normalization in the joint embedding space
         out = l2norm(out)
-
         # take absolute value, used by order embeddings
         if self.use_abs:
             out = torch.abs(out)
@@ -352,12 +313,9 @@ class VSE(object):
         # tutorials/09 - Image Captioning
         # Build Models
         self.grad_clip = opt.grad_clip
-        self.img_enc = EncoderImage(opt.data_name, opt.img_dim, opt.embed_size,
-                                    opt.finetune, opt.cnn_type,
-                                    use_abs=opt.use_abs,
-                                    no_imgnorm=opt.no_imgnorm)
+        self.img_enc = EncoderImagePrecomp(opt.img_dim, opt.embed_size, opt.use_abs, opt.no_imgnorm)
         self.txt_enc = EncoderText(opt.vocab_size, opt.word_dim,
-                                   opt.embed_size, opt.num_layers,
+                                   opt.embed_size, opt.num_layers, opt.bidi,
                                    use_abs=opt.use_abs)
         if torch.cuda.is_available():
             self.img_enc.cuda()
@@ -370,8 +328,6 @@ class VSE(object):
                                          max_violation=opt.max_violation)
         params = list(self.txt_enc.parameters())
         params += list(self.img_enc.fc.parameters())
-        if opt.finetune:
-            params += list(self.img_enc.cnn.parameters())
         self.params = params
 
         self.optimizer = torch.optim.Adam(params, lr=opt.learning_rate)
