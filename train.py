@@ -45,7 +45,8 @@ def main(opt, seed=None):
     valsets = opt.val_set.split('-')
     loader = data.get_loaders(datasets, valsets, opt.lang_prefix, 
                               opt.downsample, os.path.join(opt.logger_name, str(seed)), 
-                              opt.batch_size, synth_path=opt.synth_path)
+                              opt.batch_size, synth_path=opt.synth_path,
+                              char_level=opt.char_level)
     # Construct the model
     opt.vocab_size = len(loader.vocab.idx2word)
     model = VSE(opt)
@@ -292,6 +293,8 @@ if __name__ == '__main__':
                         help='Dimensionality of the joint embedding.')
     parser.add_argument('--bidi', action='store_true',
                         help='Run BiGRU instead of GRU.')
+    parser.add_argument('--char_level', action='store_true',
+                        help='Compute char-level embeddings')
     parser.add_argument('--grad_clip', default=2., type=float,
                         help='Gradient clipping threshold.')
     parser.add_argument('--num_layers', default=1, type=int,

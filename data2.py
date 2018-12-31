@@ -30,6 +30,9 @@ def build_vocabulary(captions, path='.', threshold=4):
     vocab.add_word('<start>')
     vocab.add_word('<end>')
     vocab.add_word('<unk>')
+    # for char-level
+    vocab.add_word('<word>')
+    vocab.add_word('</word>')
     # Add words to the vocabulary.
     for i, word in enumerate(words):
         vocab.add_word(word)
@@ -70,16 +73,66 @@ def collate_fn(data):
     return images, targets, lengths, ids
 
 
+def collate_fn_char(data):
+    """Build mini-batch tensors from a list of (image, caption) tuples.
+    Assumes input captions are in characters. Caption length is determined
+    by the <end> symbol which is hardcoded to vocab item 2.
+
+    Args:
+        data: list of (image, caption) tuple.
+            - image: torch tensor of shape (3, 256, 256).
+            - caption: torch tensor of shape (?); variable length.
+
+    Returns:
+        images: torch tensor of shape (batch_size, 3, 256, 256).
+        targets: torch tensor of shape (batch_nwords, padded_length).
+        lengths: tuple (nchars, nwords)
+            nchars (batch_nwords): valid lengths per word in terms of chars.
+            nwords (batch_size): valid caption lengths in terms of words.
+    """
+    # Sort a data list by caption length
+    data.sort(key=lambda x: len(x[1]), reverse=True)
+    images, captions, ids, img_ids = zip(*data)
+
+    # Merge images (convert tuple of 3D tensor to 4D tensor)
+    images = torch.stack(images, 0)
+
+    def segment_caption(cap):
+        cutoffs = [idx + 1 for idx, sym in enumerate(cap) if idx in set([1, 2, 5])]
+        start = 0
+        for cutoff in cutoffs:
+            yield cap[start:cutoff]
+            start = cutoff
+
+    # Get char-level input: </word> is 5, <start> is 1, <end> is 2
+    words, nchars, nwords = [], [], []
+    for cap in captions:
+        capwords = 0
+        for word in segment_caption(cap):
+            words.append(word)
+            nchars.append(len(word))
+            capwords += 1
+        nwords.append(capwords)
+
+    targets = torch.zeros(len(words), max(nchars)).long()
+    for i, word in enumerate(words):
+        targets[i, :nchars[i]] = word
+
+    return images, targets, (nchars, nwords), ids
+
+
 # prefix = lambda x: " ".join(map(lambda y: l+"_"+y, x.split()))
-def tokenize(s):
+def tokenize(s, char=False):
     """
     Remove non-alphanumeric characters, then tokenize.
-    
+
     s : str
         String to tokenize.
     """
     s = re.sub(r'([^\s\w]|_)+', '', s)
     tokens = nltk.tokenize.word_tokenize(s.lower().decode('utf-8'))
+    if char:
+        tokens = [c for w in tokens for c in ['<word>'] + list(w) + ['</word>']]
     return tokens
 
 
@@ -220,14 +273,14 @@ class ImageCaptionDataset(Dataset):
     Load precomputed captions and image features
     """
 
-    def __init__(self, captions, images, vocab=None):
+    def __init__(self, captions, images, vocab=None, char_level=False):
         # Captions
         self.captions = captions
         self.images = images
         self.length = len(self.captions)
         self.vocab = vocab
         print("Tokenizing")
-        self.tokenized_captions = [tokenize(x) for x in captions]
+        self.tokenized_captions = [tokenize(x, char=char_level) for x in captions]
         print(vocab)
 
     def __getitem__(self, index):
@@ -244,21 +297,23 @@ class ImageCaptionDataset(Dataset):
         return self.length
 
 class DatasetCollection():
-    
-    def __init__(self):
+
+    def __init__(self, char_level=False):
         self.data_loaders = {}
         self.data_iterators = {}
         self.data_sets = {}
         self.val_loaders = {}
         self.val_sets = {}
         self.vocab = None
+        self.char_level = char_level
+        self.collate_fn = collate_fn_char if char_level else collate_fn
 
     def add_trainset(self, name, dset, batch_size, shuffle=True):
         data_loader = DataLoader(dataset=dset,
                                  batch_size=batch_size,
                                  shuffle=shuffle,
                                  pin_memory=True,
-                                 collate_fn=collate_fn)
+                                 collate_fn=self.collate_fn)
         self.data_sets[name] = dset
         self.data_loaders[name] = data_loader
         self.data_iterators[name] = iter(data_loader)
@@ -268,13 +323,13 @@ class DatasetCollection():
                                  batch_size=batch_size,
                                  shuffle=False,
                                  pin_memory=True,
-                                 collate_fn=collate_fn)
+                                 collate_fn=self.collate_fn)
         self.val_sets[name] = dset
         self.val_loaders[name] = data_loader
- 
+
     def get_valloader(self, name):
         return self.val_loaders[name]
-    
+
     def get_trainloader(self, name):
         return self.data_loaders[name]
 
@@ -307,9 +362,9 @@ class DatasetCollection():
         return images, targets, lengths, ids
 
 
-def get_loaders(data_sets, val_sets, lang_prefix, downsample, 
-                path, batch_size, synth_path=None, shuffle_train=True):
-    data_loaders = DatasetCollection()
+def get_loaders(data_sets, val_sets, lang_prefix, downsample, path, batch_size,
+                synth_path=None, shuffle_train=True, char_level=False):
+    data_loaders = DatasetCollection(char_level=char_level)
     synthcaps = []
     synthnames = []
     print("Loading training sets.")
@@ -328,22 +383,24 @@ def get_loaders(data_sets, val_sets, lang_prefix, downsample,
     for name, cap in zip(synthnames, synthcaps):
         img = data_loaders.data_loaders[name].dataset.images
         n = "synth"+name
-        s = ImageCaptionDataset(cap, img)
+        s = ImageCaptionDataset(cap, img, char_level=char_level)
         data_loaders.add_trainset(n, s, batch_size, shuffle_train)
     print("Loading validation sets.")
     for name in val_sets:
         val_img, val_cap = load_data(name, 'val', lang_prefix, downsample)
-        valset = ImageCaptionDataset(val_cap, val_img) 
+        valset = ImageCaptionDataset(val_cap, val_img, char_level=char_level)
         data_loaders.add_valset(name, valset, batch_size)
     data_loaders.compute_joint_vocab(path)
-    return data_loaders 
+    return data_loaders
 
-def get_test_loader(name, split, batch_size, lang_prefix, downsample=False):
+
+def get_test_loader(name, split, batch_size, lang_prefix,
+                    downsample=False, char_level=False):
     img, cap = load_data(name, split, lang_prefix, downsample)
-    valset = ImageCaptionDataset(cap, img)
+    valset = ImageCaptionDataset(cap, img, char_level=char_level)
     loader = DataLoader(dataset=valset,
                         batch_size=batch_size,
                         shuffle=False,
                         pin_memory=True,
-                        collate_fn=collate_fn)
+                        collate_fn=collate_fn_char if char_level else collate_fn)
     return loader

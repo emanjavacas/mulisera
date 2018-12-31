@@ -314,9 +314,14 @@ class VSE(object):
         # Build Models
         self.grad_clip = opt.grad_clip
         self.img_enc = EncoderImagePrecomp(opt.img_dim, opt.embed_size, opt.use_abs, opt.no_imgnorm)
-        self.txt_enc = EncoderText(opt.vocab_size, opt.word_dim,
-                                   opt.embed_size, opt.num_layers, opt.bidi,
-                                   use_abs=opt.use_abs)
+        if opt.char_level:
+            self.txt_enc = EncoderTextChar(opt.vocab_size, opt.word_dim,
+                                           opt.embed_size, opt.num_layers, opt.bidi,
+                                           use_abs=opt.use_abs)
+        else:
+            self.txt_enc = EncoderText(opt.vocab_size, opt.word_dim,
+                                       opt.embed_size, opt.num_layers, opt.bidi,
+                                       use_abs=opt.use_abs)
         if torch.cuda.is_available():
             self.img_enc.cuda()
             self.txt_enc.cuda()

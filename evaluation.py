@@ -245,7 +245,8 @@ def run_eval(model, data_loader, fold5, opt, loader_lang):
 
 def evalrank(model_path, data_set, split='dev', fold5=False, 
              lang=None, caption_rank=False, dump_word_embeddings=False,
-             dump_image_embeddings=False, dump_caption_embeddings=False):
+             dump_image_embeddings=False, dump_caption_embeddings=False,
+             char_level=False):
     """
     Evaluate a trained model on either dev or test. If `fold5=True`, 5 fold
     cross-validation is done (only for MSCOCO). Otherwise, the full data is
@@ -273,7 +274,9 @@ def evalrank(model_path, data_set, split='dev', fold5=False,
     
     emb_dict = {}
     for name in datasets:
-        loader = get_test_loader(name, split, opt.batch_size, lang_prefix=False, downsample=False)
+        loader = get_test_loader(
+            name, split, opt.batch_size, lang_prefix=False, downsample=False,
+            char_level=char_level)
         loader.dataset.vocab = vocab
         img_emb, cap_emb = run_eval(model, loader, fold5, opt, name)
         if caption_rank:
@@ -411,6 +414,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--fold5", action="store_true")
     parser.add_argument("--split", default="val")
+    parser.add_argument("--char_level", action="store_true")
     parser.add_argument("--caption_rank", action="store_true", 
                        help="Run cross-lingual sentenceranking experiment")
     parser.add_argument("--dump_word_embeddings", action="store_true", 
@@ -423,5 +427,6 @@ if __name__ == "__main__":
     evalrank(args.model_path, data_set=args.data_set, split=args.split,
              fold5=args.fold5, caption_rank=args.caption_rank,
              dump_word_embeddings=args.dump_word_embeddings,
-	     dump_image_embeddings=args.dump_image_embeddings,
-	     dump_caption_embeddings=args.dump_caption_embeddings)
+             dump_image_embeddings=args.dump_image_embeddings,
+             dump_caption_embeddings=args.dump_caption_embeddings,
+             char_level=args.char_level)
