@@ -227,6 +227,62 @@ class EncoderText(nn.Module):
 
         return out
 
+
+class EncoderTextChar(nn.Module):
+    def __init__(self, vocab_size, word_dim, embed_size, num_layers, use_abs=False):
+        super(EncoderTextChar, self).__init__()
+        if word_dim % 2 != 0:
+            # we will use bidrectional RNN
+            raise ValueError("Please use even word_dim")
+        self.use_abs = use_abs
+        self.embed_size = embed_size
+        # char embedding
+        self.embed_char = nn.Embedding(vocab_size, word_dim)
+        # word embedding
+        self.embed = nn.GRU(
+            word_dim, word_dim // 2, bidirectional=True, batch_first=True)
+        # caption embedding
+        self.rnn = nn.GRU(word_dim, embed_size, num_layers=num_layers, batch_first=True)
+
+        self.init_weights()
+
+    def init_weights(self):
+        self.embed_char.weight.data.uniform_(-0.1, 0.1)
+
+    def forward(self, x, lengths):
+        nchars, nwords = lengths
+        # (batch_nwords x max_word_len x word_dim)
+        x = self.embed_char(x)
+        _, sort = torch.sort(torch.LongTensor(nchars), descending=True)
+        _, unsort = torch.sort(sort)
+        packed = pack_padded_sequence(
+            x[sort], torch.LongTensor(nchars)[sort].tolist(), batch_first=True)
+        _, hidden = self.embed(packed)
+        # (batch_nwords x 2 x word_dim/2) => (batch_nwords x word_dim)
+        hidden = hidden[unsort].view(hidden.size(0), -1)
+        assert len(hidden) == sum(nwords), "Asked to pad {} words but got {}".format(
+            sum(nwords), len(hidden))
+        # transform to (batch x max_sent_len x word_dim)
+        x, maxlen, last = [], max(nwords), 0
+        for length in nwords:
+            padding = 0, 0, 0, maxlen - length
+            x.append(torch.nn.functional.pad(hidden[last:last+length], padding))
+            last += length
+        x = torch.stack(hidden, dim=0)
+        # assume nwords is already sorted by length
+        x = pack_padded_sequence(x, nwords, batch_first=True)
+        _, out = self.rnn(x)
+
+        # normalize
+        out = l2norm(out)
+
+        # take absolute value, used by order embeddings
+        if self.use_abs:
+            out = torch.abs(out)
+
+        return out
+
+
 def cosine_sim(im, s):
     """Cosine similarity between all the image and sentence pairs
     """

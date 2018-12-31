@@ -626,6 +626,45 @@ def collate_fn(data):
     return images, targets, lengths, ids
 
 
+def collate_fn_char(data):
+    """Build mini-batch tensors from a list of (image, caption) tuples.
+    Assumes input captions are in characters. Caption length is determined
+    by the <eos> symbol which is hardcoded to vocab item 4.
+
+    Args:
+        data: list of (image, caption) tuple.
+            - image: torch tensor of shape (3, 256, 256).
+            - caption: torch tensor of shape (?); variable length.
+
+    Returns:
+        images: torch tensor of shape (batch_size, 3, 256, 256).
+        targets: torch tensor of shape (batch_nwords, padded_length).
+        lengths: tuple (nchars, nwords)
+            nchars (batch_nwords): valid lengths per word in terms of chars.
+            nwords (batch_size): valid caption lengths in terms of words.
+    """
+    # Sort a data list by caption length
+    data.sort(key=lambda x: len(x[1]), reverse=True)
+    images, captions, ids, img_ids = zip(*data)
+
+    # Merge images (convert tuple of 3D tensor to 4D tensor)
+    images = torch.stack(images, 0)
+
+    # Merget captions (convert tuple of 1D tensor to 2D tensor)
+    nwords = []
+    last = 0
+    nchars = [len(cap) for cap in captions]
+    targets = torch.zeros(len(captions), max(nchars)).long()
+    for i, cap in enumerate(captions):
+        end = nchars[i]
+        targets[i, :end] = cap[:end]
+        if len(cap) == 1 and cap[0] == 4:
+            nwords.append(i - last)
+            last = i
+
+    return images, targets, (nchars, nwords), ids
+
+
 
 def get_loader_single(data_name, split, root, json, vocab, transform,
                       batch_size=100, shuffle=True,
